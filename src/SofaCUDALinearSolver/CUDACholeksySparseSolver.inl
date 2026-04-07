@@ -26,37 +26,55 @@
 #include <sofa/helper/ScopedAdvancedTimer.h>
 #include <SofaCUDALinearSolver/utils.h>
 #include <cusparse.h>
-
+#include <cstring>
+#include <numeric>
 
 namespace sofa::component::linearsolver::direct
 {
 
-template<class TMatrix , class TVector>
+// Helper macro for cuDSS error checking
+#define checkCuDSS(status) __checkCuDSS(status, __FILE__, __LINE__)
+
+inline void __checkCuDSS(cudssStatus_t status, const char* file, int line)
+{
+    if (status != CUDSS_STATUS_SUCCESS)
+    {
+        const char* statusName = "UNKNOWN";
+        switch (status)
+        {
+            case CUDSS_STATUS_SUCCESS: statusName = "SUCCESS"; break;
+            case CUDSS_STATUS_NOT_INITIALIZED: statusName = "NOT_INITIALIZED"; break;
+            case CUDSS_STATUS_ALLOC_FAILED: statusName = "ALLOC_FAILED"; break;
+            case CUDSS_STATUS_INVALID_VALUE: statusName = "INVALID_VALUE"; break;
+            case CUDSS_STATUS_NOT_SUPPORTED: statusName = "NOT_SUPPORTED"; break;
+            case CUDSS_STATUS_EXECUTION_FAILED: statusName = "EXECUTION_FAILED"; break;
+            case CUDSS_STATUS_INTERNAL_ERROR: statusName = "INTERNAL_ERROR"; break;
+            default: break;
+        }
+        msg_error("SofaCUDALinearSolver") << "cuDSS error at " << file << ":" << line
+                                          << " - Status: " << statusName;
+        exit(EXIT_FAILURE);
+    }
+}
+
+template<class TMatrix, class TVector>
 CUDASparseCholeskySolver<TMatrix,TVector>::CUDASparseCholeskySolver()
     : Inherit1()
-    , d_typePermutation(initData(&d_typePermutation, "permutation", "Type of fill-in reducing permutation"))
+    , d_typePermutation(initData(&d_typePermutation, "permutation", "Type of fill-in reducing permutation (GPU: DEFAULT/AMD, CPU: None/RCM/AMD/METIS)"))
     , d_hardware(initData(&d_hardware, "hardware", "On which hardware to solve the linear system: CPU or GPU"))
 {
-    sofa::helper::OptionsGroup typePermutationOptions{{"None","RCM" ,"AMD", "METIS"}};
+    sofa::helper::OptionsGroup typePermutationOptions{{"None", "RCM", "AMD", "METIS"}};
     typePermutationOptions.setSelectedItem(0); // default None
     d_typePermutation.setValue(typePermutationOptions);
 
     sofa::helper::OptionsGroup hardwareOptions{{"CPU", "GPU"}};
-    hardwareOptions.setSelectedItem(1);
+    hardwareOptions.setSelectedItem(1); // default GPU
     d_hardware.setValue(hardwareOptions);
 
-    cusolverSpCreate(&handle);
-    cusparseCreate(&cusparseHandle);
-
+    // Create CUDA stream
     cudaStreamCreate(&stream);
 
-    cusolverSpSetStream(handle, stream);
-    cusparseSetStream(cusparseHandle, stream);
-
-    cusparseCreateMatDescr(&descr);
-    cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);
-    cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO);
-
+    // Initialize pointers to nullptr
     host_RowPtr = nullptr;
     host_ColsInd = nullptr;
     host_values = nullptr;
@@ -64,414 +82,497 @@ CUDASparseCholeskySolver<TMatrix,TVector>::CUDASparseCholeskySolver()
     device_RowPtr = nullptr;
     device_ColsInd = nullptr;
     device_values = nullptr;
-
     device_x = nullptr;
     device_b = nullptr;
 
-    buffer_cpu = nullptr;
-    buffer_gpu = nullptr;
-    device_info = nullptr;
+    // cuDSS state
+    cudssHandle = nullptr;
+    cudssConfig = nullptr;
+    cudssData = nullptr;
+    cudssMatrixA = nullptr;
+    cudssMatrixX = nullptr;
+    cudssMatrixB = nullptr;
+    cudssInitialized = false;
+
+    // cusolverSp state (CPU path)
+    cusolverHandle = nullptr;
+    cusparseDescr = nullptr;
     host_info = nullptr;
-
-    singularity = 0;
-
-    size_internal = 0;
-    size_work = 0;
+    buffer_cpu = nullptr;
+    buffer_perm = nullptr;
+    size_internal_cpu = 0;
+    size_work_cpu = 0;
     size_perm = 0;
-
-    notSameShape = true;
-
-    nnz = 0;
-    previous_n = 0 ;
-    previous_nnz = 0;
-    rows = 0;
     reorder = 0;
-    previous_ColsInd.clear() ;
-    previous_RowPtr.clear() ;
 
+    // Common state
+    notSameShape = true;
+    nnz = 0;
+    rows = 0;
+    cols = 0;
+    previous_n = 0;
+    previous_nnz = 0;
+
+    previous_ColsInd.clear();
+    previous_RowPtr.clear();
 }
 
-template<class TMatrix , class TVector>
+template<class TMatrix, class TVector>
 CUDASparseCholeskySolver<TMatrix,TVector>::~CUDASparseCholeskySolver()
 {
-    previous_RowPtr.clear();
-    previous_ColsInd.clear();
+    cleanupCuDSS();
+    cleanupCuSolverHost();
 
-    checkCudaErrors(cudaFree(device_x));
-    checkCudaErrors(cudaFree(device_b));
-    checkCudaErrors(cudaFree(device_RowPtr));
-    checkCudaErrors(cudaFree(device_ColsInd));
-    checkCudaErrors(cudaFree(device_values));
+    if (device_x) cudaFree(device_x);
+    if (device_b) cudaFree(device_b);
+    if (device_RowPtr) cudaFree(device_RowPtr);
+    if (device_ColsInd) cudaFree(device_ColsInd);
+    if (device_values) cudaFree(device_values);
 
-    cusolverSpDestroy(handle);
-    cusolverSpDestroyCsrcholInfo(device_info);
-    cusolverSpDestroyCsrcholInfoHost(host_info);
-    cusparseDestroyMatDescr(descr);
     cudaStreamDestroy(stream);
 }
 
-template <class TMatrix, class TVector>
-void CUDASparseCholeskySolver<TMatrix, TVector>::setWorkspace()
-{
-    if (d_hardware.getValue().getSelectedId() == 0)
-    {
-        const int* hRow = reorder != 0 ? host_rowPermuted.data() : host_RowPtr;
-        const int* hCol = reorder != 0 ? host_colPermuted.data() : host_ColsInd;
-        const Real* hValues = reorder != 0 ? host_valuePermuted.data() : host_values;
+// ============================================================================
+// cuDSS GPU Path
+// ============================================================================
 
-        if constexpr (std::is_same_v<Real, double>)
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::initCuDSS()
+{
+    if (cudssInitialized) return;
+
+    checkCuDSS(cudssCreate(&cudssHandle));
+    checkCuDSS(cudssSetStream(cudssHandle, stream));
+    checkCuDSS(cudssConfigCreate(&cudssConfig));
+    checkCuDSS(cudssDataCreate(cudssHandle, &cudssData));
+
+    // Configure reordering algorithm based on user selection
+    // cuDSS options: CUDSS_ALG_DEFAULT (METIS-based), CUDSS_ALG_3 (AMD)
+    int permOption = d_typePermutation.getValue().getSelectedId();
+    cudssAlgType_t reorderAlg = CUDSS_ALG_DEFAULT;
+
+    if (permOption == 2) // AMD
+    {
+        reorderAlg = CUDSS_ALG_3;
+    }
+    // For None, RCM, METIS -> use DEFAULT (METIS-based nested dissection)
+
+    checkCuDSS(cudssConfigSet(cudssConfig, CUDSS_CONFIG_REORDERING_ALG,
+                              &reorderAlg, sizeof(reorderAlg)));
+
+    cudssInitialized = true;
+}
+
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::cleanupCuDSS()
+{
+    if (!cudssInitialized) return;
+
+    if (cudssMatrixA) { cudssMatrixDestroy(cudssMatrixA); cudssMatrixA = nullptr; }
+    if (cudssMatrixX) { cudssMatrixDestroy(cudssMatrixX); cudssMatrixX = nullptr; }
+    if (cudssMatrixB) { cudssMatrixDestroy(cudssMatrixB); cudssMatrixB = nullptr; }
+    if (cudssData) { cudssDataDestroy(cudssHandle, cudssData); cudssData = nullptr; }
+    if (cudssConfig) { cudssConfigDestroy(cudssConfig); cudssConfig = nullptr; }
+    if (cudssHandle) { cudssDestroy(cudssHandle); cudssHandle = nullptr; }
+
+    cudssInitialized = false;
+}
+
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::invertGPU()
+{
+    initCuDSS();
+
+    // Allocate/reallocate device memory if needed
+    if (previous_n < rows)
+    {
+        if (device_RowPtr) cudaFree(device_RowPtr);
+        if (device_x) cudaFree(device_x);
+        if (device_b) cudaFree(device_b);
+
+        checkCudaErrors(cudaMalloc(&device_RowPtr, sizeof(int) * (rows + 1)));
+        checkCudaErrors(cudaMalloc(&device_x, sizeof(Real) * cols));
+        checkCudaErrors(cudaMalloc(&device_b, sizeof(Real) * cols));
+    }
+
+    if (previous_nnz < nnz)
+    {
+        if (device_ColsInd) cudaFree(device_ColsInd);
+        if (device_values) cudaFree(device_values);
+
+        checkCudaErrors(cudaMalloc(&device_ColsInd, sizeof(int) * nnz));
+        checkCudaErrors(cudaMalloc(&device_values, sizeof(Real) * nnz));
+    }
+
+    // Copy matrix structure to device (only if shape changed)
+    if (notSameShape)
+    {
+        checkCudaErrors(cudaMemcpyAsync(device_RowPtr, host_RowPtr,
+                        sizeof(int) * (rows + 1), cudaMemcpyHostToDevice, stream));
+        checkCudaErrors(cudaMemcpyAsync(device_ColsInd, host_ColsInd,
+                        sizeof(int) * nnz, cudaMemcpyHostToDevice, stream));
+    }
+
+    // Always copy values (they change each time step)
+    checkCudaErrors(cudaMemcpyAsync(device_values, host_values,
+                    sizeof(Real) * nnz, cudaMemcpyHostToDevice, stream));
+
+    // Recreate matrix wrappers if shape changed
+    if (notSameShape)
+    {
+        // Destroy old matrix wrappers
+        if (cudssMatrixA) { cudssMatrixDestroy(cudssMatrixA); cudssMatrixA = nullptr; }
+        if (cudssMatrixX) { cudssMatrixDestroy(cudssMatrixX); cudssMatrixX = nullptr; }
+        if (cudssMatrixB) { cudssMatrixDestroy(cudssMatrixB); cudssMatrixB = nullptr; }
+
+        // Determine data type
+        cudaDataType_t valueType = std::is_same_v<Real, double> ? CUDA_R_64F : CUDA_R_32F;
+
+        // Create sparse matrix wrapper (SPD = Symmetric Positive Definite -> Cholesky)
+        checkCuDSS(cudssMatrixCreateCsr(
+            &cudssMatrixA,
+            rows, cols, nnz,
+            device_RowPtr,
+            nullptr,  // rowEnd (optional)
+            device_ColsInd,
+            device_values,
+            CUDA_R_32I,         // index type
+            valueType,          // value type
+            CUDSS_MTYPE_SPD,    // matrix type: symmetric positive definite
+            CUDSS_MVIEW_FULL,   // full matrix view (we have full symmetric matrix)
+            CUDSS_BASE_ZERO     // zero-based indexing
+        ));
+
+        // Create dense vector wrappers
+        checkCuDSS(cudssMatrixCreateDn(&cudssMatrixX, rows, 1, rows, device_x,
+                                       valueType, CUDSS_LAYOUT_COL_MAJOR));
+        checkCuDSS(cudssMatrixCreateDn(&cudssMatrixB, rows, 1, rows, device_b,
+                                       valueType, CUDSS_LAYOUT_COL_MAJOR));
+
+        // Analysis phase (reordering + symbolic factorization)
         {
-            checksolver(cusolverSpDcsrcholBufferInfoHost( handle, rows, nnz, descr, hValues, hRow, hCol,
-                host_info, &size_internal, &size_work ));
+            sofa::helper::ScopedAdvancedTimer analysisTimer("cuDSS Analysis");
+            checkCuDSS(cudssExecute(cudssHandle, CUDSS_PHASE_ANALYSIS, cudssConfig,
+                                    cudssData, cudssMatrixA, cudssMatrixX, cudssMatrixB));
         }
-        else
-        {
-            checksolver(cusolverSpScsrcholBufferInfoHost( handle, rows, nnz, descr, hValues, hRow, hCol,
-                host_info, &size_internal, &size_work ));
-        }
+
+        // Store shape for comparison
+        previous_nnz = nnz;
+        previous_RowPtr.resize(rows + 1);
+        previous_ColsInd.resize(nnz);
+        std::memcpy(previous_ColsInd.data(), host_ColsInd, sizeof(int) * nnz);
+        std::memcpy(previous_RowPtr.data(), host_RowPtr, sizeof(int) * (rows + 1));
     }
     else
     {
-        if constexpr (std::is_same_v<Real, double>)
-        {
-            checksolver(cusolverSpDcsrcholBufferInfo( handle, rows, nnz, descr, device_values, device_RowPtr, device_ColsInd,
-                device_info, &size_internal, &size_work ));
-        }
-        else
-        {
-            checksolver(cusolverSpScsrcholBufferInfo( handle, rows, nnz, descr, device_values, device_RowPtr, device_ColsInd,
-                device_info, &size_internal, &size_work ));
-        }
+        // Update values pointer in existing matrix wrapper
+        checkCuDSS(cudssMatrixSetCsrPointers(cudssMatrixA, device_RowPtr, nullptr,
+                                             device_ColsInd, device_values));
+    }
+
+    // Numeric factorization
+    {
+        sofa::helper::ScopedAdvancedTimer factorTimer("cuDSS Factorization");
+        checkCuDSS(cudssExecute(cudssHandle, CUDSS_PHASE_FACTORIZATION, cudssConfig,
+                                cudssData, cudssMatrixA, cudssMatrixX, cudssMatrixB));
+        cudaStreamSynchronize(stream);
     }
 }
 
-template <class TMatrix, class TVector>
-void CUDASparseCholeskySolver<TMatrix, TVector>::numericFactorization()
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::solveGPU(int n, Real* b_host, Real* x_host)
 {
-    if (d_hardware.getValue().getSelectedId() == 0)
+    // Copy RHS to device
     {
-        const int* hRow = reorder != 0 ? host_rowPermuted.data() : host_RowPtr;
-        const int* hCol = reorder != 0 ? host_colPermuted.data() : host_ColsInd;
-        const Real* hValues = reorder != 0 ? host_valuePermuted.data() : host_values;
-
-        if constexpr (std::is_same_v<Real, double>)
-        {
-            checksolver(cusolverSpDcsrcholFactorHost( handle, rows, nnz, descr, hValues, hRow, hCol,
-                host_info, buffer_gpu ));
-        }
-        else
-        {
-            checksolver(cusolverSpScsrcholFactorHost( handle, rows, nnz, descr, hValues, hRow, hCol,
-                host_info, buffer_gpu ));
-        }
+        sofa::helper::ScopedAdvancedTimer copyTimer("copyRHSToDevice");
+        checkCudaErrors(cudaMemcpyAsync(device_b, b_host, sizeof(Real) * n,
+                        cudaMemcpyHostToDevice, stream));
     }
-    else
+
+    // Solve
     {
-        if constexpr (std::is_same_v<Real, double>)
-        {
-            checksolver(cusolverSpDcsrcholFactor( handle, rows, nnz, descr, device_values, device_RowPtr, device_ColsInd,
-                device_info, buffer_gpu ));
-        }
-        else
-        {
-            checksolver(cusolverSpScsrcholFactor( handle, rows, nnz, descr, device_values, device_RowPtr, device_ColsInd,
-                device_info, buffer_gpu ));
-        }
+        sofa::helper::ScopedAdvancedTimer solveTimer("cuDSS Solve");
+        checkCuDSS(cudssExecute(cudssHandle, CUDSS_PHASE_SOLVE, cudssConfig,
+                                cudssData, cudssMatrixA, cudssMatrixX, cudssMatrixB));
+    }
+
+    // Copy solution to host
+    {
+        sofa::helper::ScopedAdvancedTimer copyTimer("copySolutionToHost");
+        checkCudaErrors(cudaMemcpyAsync(x_host, device_x, sizeof(Real) * n,
+                        cudaMemcpyDeviceToHost, stream));
+        cudaStreamSynchronize(stream);
     }
 }
 
-template <class TMatrix, class TVector>
-void CUDASparseCholeskySolver<TMatrix, TVector>::createCholeskyInfo()
-{
-    cusolverSpDestroyCsrcholInfo(device_info);
-    cusolverSpDestroyCsrcholInfoHost(host_info);
+// ============================================================================
+// cusolverSp CPU Path
+// ============================================================================
 
-    if (d_hardware.getValue().getSelectedId() == 0)
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::initCuSolverHost()
+{
+    if (cusolverHandle) return;
+
+    cusolverSpCreate(&cusolverHandle);
+    cusparseCreateMatDescr(&cusparseDescr);
+    cusparseSetMatType(cusparseDescr, CUSPARSE_MATRIX_TYPE_GENERAL);
+    cusparseSetMatIndexBase(cusparseDescr, CUSPARSE_INDEX_BASE_ZERO);
+}
+
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::cleanupCuSolverHost()
+{
+    if (host_info) { cusolverSpDestroyCsrcholInfoHost(host_info); host_info = nullptr; }
+    if (cusparseDescr) { cusparseDestroyMatDescr(cusparseDescr); cusparseDescr = nullptr; }
+    if (cusolverHandle) { cusolverSpDestroy(cusolverHandle); cusolverHandle = nullptr; }
+    if (buffer_cpu) { cudaFreeHost(buffer_cpu); buffer_cpu = nullptr; }
+    if (buffer_perm) { free(buffer_perm); buffer_perm = nullptr; }
+}
+
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::invertCPU()
+{
+    initCuSolverHost();
+
+    reorder = d_typePermutation.getValue().getSelectedId();
+
+    // Resize permutation buffers if needed
+    if (previous_n < rows)
     {
+        host_rowPermuted.resize(rows + 1);
+        host_bPermuted.resize(rows);
+        host_xPermuted.resize(rows);
+    }
+
+    if (previous_nnz < nnz)
+    {
+        host_colPermuted.resize(nnz);
+        host_valuePermuted.resize(nnz);
+    }
+
+    // Compute fill-reducing permutation (only if shape changed)
+    if (reorder != 0 && notSameShape)
+    {
+        sofa::helper::ScopedAdvancedTimer permTimer("Permutations");
+
+        host_perm.resize(rows);
+
+        switch (reorder)
+        {
+            case 1: // RCM
+                checksolver(cusolverSpXcsrsymrcmHost(cusolverHandle, rows, nnz, cusparseDescr,
+                            host_RowPtr, host_ColsInd, host_perm.data()));
+                break;
+            case 2: // AMD
+                checksolver(cusolverSpXcsrsymamdHost(cusolverHandle, rows, nnz, cusparseDescr,
+                            host_RowPtr, host_ColsInd, host_perm.data()));
+                break;
+            case 3: // METIS
+                checksolver(cusolverSpXcsrmetisndHost(cusolverHandle, rows, nnz, cusparseDescr,
+                            host_RowPtr, host_ColsInd, nullptr, host_perm.data()));
+                break;
+            default:
+                break;
+        }
+
+        checksolver(cusolverSpXcsrperm_bufferSizeHost(cusolverHandle, rows, cols, nnz, cusparseDescr,
+                    host_RowPtr, host_ColsInd, host_perm.data(), host_perm.data(), &size_perm));
+
+        if (buffer_perm) free(buffer_perm);
+        buffer_perm = malloc(size_perm);
+
+        host_map.resize(nnz);
+        std::iota(host_map.begin(), host_map.end(), 0);
+
+        // Apply permutation to structure
+        std::memcpy(host_rowPermuted.data(), host_RowPtr, sizeof(int) * (rows + 1));
+        std::memcpy(host_colPermuted.data(), host_ColsInd, sizeof(int) * nnz);
+
+        checksolver(cusolverSpXcsrpermHost(cusolverHandle, rows, cols, nnz, cusparseDescr,
+                    host_rowPermuted.data(), host_colPermuted.data(), host_perm.data(),
+                    host_perm.data(), host_map.data(), buffer_perm));
+    }
+
+    // Apply permutation to values
+    if (reorder != 0)
+    {
+        sofa::helper::ScopedAdvancedTimer reorderTimer("ReorderValues");
+        for (int i = 0; i < nnz; i++)
+        {
+            host_valuePermuted[i] = host_values[host_map[i]];
+        }
+    }
+
+    const int* hRow = (reorder != 0) ? host_rowPermuted.data() : host_RowPtr;
+    const int* hCol = (reorder != 0) ? host_colPermuted.data() : host_ColsInd;
+    const Real* hValues = (reorder != 0) ? host_valuePermuted.data() : host_values;
+
+    // Symbolic factorization (only if shape changed)
+    if (notSameShape)
+    {
+        if (host_info) cusolverSpDestroyCsrcholInfoHost(host_info);
         checksolver(cusolverSpCreateCsrcholInfoHost(&host_info));
+
+        {
+            sofa::helper::ScopedAdvancedTimer symbolicTimer("Symbolic factorization");
+            checksolver(cusolverSpXcsrcholAnalysisHost(cusolverHandle, rows, nnz,
+                        cusparseDescr, hRow, hCol, host_info));
+        }
+
+        // Get buffer size
+        if constexpr (std::is_same_v<Real, double>)
+        {
+            checksolver(cusolverSpDcsrcholBufferInfoHost(cusolverHandle, rows, nnz, cusparseDescr,
+                        hValues, hRow, hCol, host_info, &size_internal_cpu, &size_work_cpu));
+        }
+        else
+        {
+            checksolver(cusolverSpScsrcholBufferInfoHost(cusolverHandle, rows, nnz, cusparseDescr,
+                        hValues, hRow, hCol, host_info, &size_internal_cpu, &size_work_cpu));
+        }
+
+        if (buffer_cpu) cudaFreeHost(buffer_cpu);
+        checkCudaErrors(cudaMallocHost(&buffer_cpu, size_work_cpu));
+
+        // Store shape for comparison
+        previous_nnz = nnz;
+        previous_RowPtr.resize(rows + 1);
+        previous_ColsInd.resize(nnz);
+        std::memcpy(previous_ColsInd.data(), host_ColsInd, sizeof(int) * nnz);
+        std::memcpy(previous_RowPtr.data(), host_RowPtr, sizeof(int) * (rows + 1));
     }
-    else
+
+    // Numeric factorization
     {
-        checksolver(cusolverSpCreateCsrcholInfo(&device_info));
+        sofa::helper::ScopedAdvancedTimer numericTimer("Numeric factorization");
+        if constexpr (std::is_same_v<Real, double>)
+        {
+            checksolver(cusolverSpDcsrcholFactorHost(cusolverHandle, rows, nnz, cusparseDescr,
+                        hValues, hRow, hCol, host_info, buffer_cpu));
+        }
+        else
+        {
+            checksolver(cusolverSpScsrcholFactorHost(cusolverHandle, rows, nnz, cusparseDescr,
+                        hValues, hRow, hCol, host_info, buffer_cpu));
+        }
     }
 }
 
-template <class TMatrix, class TVector>
-void CUDASparseCholeskySolver<TMatrix, TVector>::symbolicFactorization()
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::solveCPU(int n, Real* b_host, Real* x_host)
 {
-    if (d_hardware.getValue().getSelectedId() == 0)
+    Real* solveB = b_host;
+    Real* solveX = x_host;
+
+    // Apply permutation to RHS
+    if (reorder != 0)
     {
-        const int* hRow = reorder != 0 ? host_rowPermuted.data() : host_RowPtr;
-        const int* hCol = reorder != 0 ? host_colPermuted.data() : host_ColsInd;
-        checksolver(cusolverSpXcsrcholAnalysisHost( handle, rows, nnz, descr, hRow, hCol, host_info ));
+        sofa::helper::ScopedAdvancedTimer reorderTimer("reorderRHS");
+        for (int i = 0; i < n; i++)
+        {
+            host_bPermuted[i] = b_host[host_perm[i]];
+        }
+        solveB = host_bPermuted.data();
+        solveX = host_xPermuted.data();
     }
-    else
+
+    // Solve
     {
-        checksolver(cusolverSpXcsrcholAnalysis( handle, rows, nnz, descr, device_RowPtr, device_ColsInd, device_info ));
-        cudaStreamSynchronize(stream);// for the timer
+        sofa::helper::ScopedAdvancedTimer solveTimer("Solve");
+        if constexpr (std::is_same_v<Real, double>)
+        {
+            checksolver(cusolverSpDcsrcholSolveHost(cusolverHandle, n, solveB, solveX,
+                        host_info, buffer_cpu));
+        }
+        else
+        {
+            checksolver(cusolverSpScsrcholSolveHost(cusolverHandle, n, solveB, solveX,
+                        host_info, buffer_cpu));
+        }
+    }
+
+    // Apply inverse permutation to solution
+    if (reorder != 0)
+    {
+        sofa::helper::ScopedAdvancedTimer reorderTimer("reorderSolution");
+        for (int i = 0; i < n; i++)
+        {
+            x_host[host_perm[i]] = host_xPermuted[i];
+        }
     }
 }
 
-template<class TMatrix , class TVector>
-void CUDASparseCholeskySolver<TMatrix,TVector>:: invert(Matrix& M)
+// ============================================================================
+// Main interface methods
+// ============================================================================
+
+template<class TMatrix, class TVector>
+void CUDASparseCholeskySolver<TMatrix,TVector>::invert(Matrix& M)
 {
     sofa::helper::ScopedAdvancedTimer invertTimer("invert");
 
+    // Copy and compress matrix data
     {
         sofa::helper::ScopedAdvancedTimer copyTimer("copyMatrixData");
         m_filteredMatrix.copyNonZeros(M);
         m_filteredMatrix.compress();
     }
 
-    reorder = d_typePermutation.getValue().getSelectedId() ;
     rows = m_filteredMatrix.rowSize();
     cols = m_filteredMatrix.colSize();
-    nnz = m_filteredMatrix.getColsValue().size(); // number of non zero coefficients
+    nnz = m_filteredMatrix.getColsValue().size();
 
-    host_RowPtr = (int*) m_filteredMatrix.getRowBegin().data();
-    host_ColsInd = (int*) m_filteredMatrix.getColsIndex().data();
-    host_values = (Real*) m_filteredMatrix.getColsValue().data();
+    host_RowPtr = (int*)m_filteredMatrix.getRowBegin().data();
+    host_ColsInd = (int*)m_filteredMatrix.getColsIndex().data();
+    host_values = (Real*)m_filteredMatrix.getColsValue().data();
 
+    // Check if matrix shape changed
     {
-        sofa::helper::ScopedAdvancedTimer compareMatrixShapeTimer("compareMatrixShape");
-        notSameShape = compareMatrixShape(rows , host_ColsInd, host_RowPtr, previous_RowPtr.size()-1,  previous_ColsInd.data(), previous_RowPtr.data() );
+        sofa::helper::ScopedAdvancedTimer compareTimer("compareMatrixShape");
+        notSameShape = compareMatrixShape(rows, host_ColsInd, host_RowPtr,
+                       previous_RowPtr.size() - 1, previous_ColsInd.data(), previous_RowPtr.data());
     }
 
-    // allocate memory
-    if(previous_n < rows)
-    {
-        host_rowPermuted.resize(rows + 1);
-
-        if (d_hardware.getValue().getSelectedId() != 0)
-        {
-            checkCudaErrors(cudaMalloc( &device_RowPtr, sizeof(int)*( rows +1) ));
-
-            checkCudaErrors(cudaMalloc(&device_x, sizeof(Real)*cols));
-            checkCudaErrors(cudaMalloc(&device_b, sizeof(Real)*cols));
-        }
-    }
-
-    if(previous_nnz < nnz)
-    {
-        if (d_hardware.getValue().getSelectedId() != 0)
-        {
-            if(device_ColsInd) cudaFree(device_ColsInd);
-            checkCudaErrors(cudaMalloc( &device_ColsInd, sizeof(int)*nnz ));
-            if(device_values) cudaFree(device_values);
-            checkCudaErrors(cudaMalloc( &device_values, sizeof(Real)*nnz ));
-        }
-        host_colPermuted.resize(nnz);
-        host_valuePermuted.resize(nnz);
-    }
-
-    // A = PAQ
-    // compute fill reducing permutation
-    if( reorder != 0 && notSameShape)
-    {
-        sofa::helper::ScopedAdvancedTimer permutationsTimer("Permutations");
-
-        host_perm.resize(rows);
-
-        switch( reorder )
-        {
-            default:
-            case 0:// None, this case should not be visited 
-                break;
-
-            case 1://RCM, Symmetric Reverse Cuthill-McKee permutation
-                checksolver( cusolverSpXcsrsymrcmHost(handle, rows, nnz, descr, host_RowPtr, host_ColsInd, host_perm.data()) );
-                break;
-
-            case 2://AMD, Symmetric Approximate Minimum Degree Algorithm based on Quotient Graph
-                checksolver( cusolverSpXcsrsymamdHost(handle, rows, nnz, descr, host_RowPtr, host_ColsInd, host_perm.data()) );
-                break;
-
-            case 3://METIS, nested dissection
-                checksolver( cusolverSpXcsrmetisndHost(handle, rows, nnz, descr, host_RowPtr, host_ColsInd, nullptr, host_perm.data()) );
-                break;
-        }
-        checksolver( cusolverSpXcsrperm_bufferSizeHost(handle, rows, cols, nnz, descr, host_RowPtr, host_ColsInd
-                                                    , host_perm.data(), host_perm.data(), &size_perm) );
-
-        if(buffer_cpu) free(buffer_cpu);
-        buffer_cpu = (void*)malloc(sizeof(char)*size_perm) ;
-
-        host_map.resize(nnz);
-        std::iota(host_map.begin(), host_map.end(), 0);
-
-        //apply the permutation
-        for(int i=0;i<rows+1;i++) host_rowPermuted[i] = host_RowPtr[i];
-        for(int i=0;i<nnz;i++) host_colPermuted[i] = host_ColsInd[i];
-        checksolver( cusolverSpXcsrpermHost( handle, rows, cols, nnz, descr, host_rowPermuted.data(), host_colPermuted.data()
-                                        , host_perm.data(), host_perm.data(), host_map.data(), buffer_cpu ));
-    }
-
-    // send data to the device
-    if (notSameShape && d_hardware.getValue().getSelectedId() != 0)
-    {
-        const int* host_rowPtrToCopy = reorder != 0 ? host_rowPermuted.data() : host_RowPtr;
-        const int* host_colPtrToCopy = reorder != 0 ? host_colPermuted.data() : host_ColsInd;
-
-        checkCudaErrors( cudaMemcpyAsync( device_RowPtr, host_rowPtrToCopy, sizeof(int)*(rows+1), cudaMemcpyHostToDevice, stream) );
-        checkCudaErrors( cudaMemcpyAsync( device_ColsInd, host_colPtrToCopy, sizeof(int)*nnz, cudaMemcpyHostToDevice, stream ) );
-    }
-
-    //store the shape of the matrix
-    if(notSameShape)
-    {
-        previous_nnz = nnz ;
-        previous_RowPtr.resize( rows + 1 );
-        previous_ColsInd.resize( nnz );
-        for(int i=0;i<nnz;i++) previous_ColsInd[i] = host_ColsInd[i];
-        for(int i=0; i<rows +1; i++) previous_RowPtr[i] = host_RowPtr[i];
-    }
-
-    if( reorder != 0)
-    {
-        sofa::helper::ScopedAdvancedTimer reorderValuesTimer("ReorderValues");
-        for(int i=0;i<nnz;i++)
-        {
-            host_valuePermuted[i] = host_values[ host_map[i] ];
-        }
-    }
-
-    if (d_hardware.getValue().getSelectedId() != 0)
-    {
-        const Real* hostValuesToCopy = reorder != 0 ? host_valuePermuted.data() : host_values;
-        checkCudaErrors( cudaMemcpyAsync( device_values, hostValuesToCopy, sizeof(Real)*nnz, cudaMemcpyHostToDevice, stream ) );
-    }
-    
-    // factorize on device LL^t = PAP^t 
-    if(notSameShape)
-    {
-        createCholeskyInfo();
-        {
-            sofa::helper::ScopedAdvancedTimer symbolicTimer("Symbolic factorization");
-            symbolicFactorization();
-        }
-
-        setWorkspace();
-
-        if(buffer_gpu) cudaFree(buffer_gpu);
-        if (d_hardware.getValue().getSelectedId() == 0)
-        {
-            checkCudaErrors(cudaMallocHost(&buffer_gpu, sizeof(char)*size_work));
-        }
-        else
-        {
-            checkCudaErrors(cudaMalloc(&buffer_gpu, sizeof(char)*size_work));
-        }
-    }
-    
-    {
-        sofa::helper::ScopedAdvancedTimer numericTimer("Numeric factorization");
-        numericFactorization();
-        cudaStreamSynchronize(stream);// for the timer
-    }
-}
-
-template <class TMatrix, class TVector>
-void CUDASparseCholeskySolver<TMatrix, TVector>::solve_impl(int n, Real* b, Real* x)
-{
+    // Dispatch to appropriate implementation
     if (d_hardware.getValue().getSelectedId() == 0)
     {
-        Real* host_b = (reorder != 0) ? host_bPermuted.data() : b;
-        Real* host_x = (reorder != 0) ? host_xPermuted.data() : x;
-
-        if constexpr (std::is_same_v<Real, double>)
-        {
-            checksolver(cusolverSpDcsrcholSolveHost( handle, n, host_b, host_x, host_info, buffer_gpu ));
-        }
-        else
-        {
-            checksolver(cusolverSpScsrcholSolveHost( handle, n, host_b, host_x, host_info, buffer_gpu ));
-        }
+        invertCPU();
     }
     else
     {
-        if constexpr (std::is_same_v<Real, double>)
-        {
-            checksolver(cusolverSpDcsrcholSolve( handle, n, device_b, device_x, device_info, buffer_gpu ));
-        }
-        else
-        {
-            checksolver(cusolverSpScsrcholSolve( handle, n, device_b, device_x, device_info, buffer_gpu ));
-        }
+        invertGPU();
     }
+
+    previous_n = rows;
 }
 
-template<class TMatrix , class TVector>
+template<class TMatrix, class TVector>
 void CUDASparseCholeskySolver<TMatrix,TVector>::solve(Matrix& M, Vector& x, Vector& b)
 {
     sofa::helper::ScopedAdvancedTimer solveTimer("solve");
-    int n = M.colSize()  ; // avoidable, used to prevent compilation warning
 
-    if( previous_n < n && reorder !=0 )
+    int n = M.colSize();
+
+    if (d_hardware.getValue().getSelectedId() == 0)
     {
-        host_bPermuted.resize(n);
-        host_xPermuted.resize(n);
+        solveCPU(n, b.ptr(), x.ptr());
     }
-
-    if( reorder != 0 )
+    else
     {
-        sofa::helper::ScopedAdvancedTimer reorderRHSTimer("reorderRHS");
-        for(int i = 0; i < n; ++i)
-        {
-            host_bPermuted[i] = b[ host_perm[i] ];
-        }
+        solveGPU(n, b.ptr(), x.ptr());
     }
-    Real* host_b = (reorder != 0) ? host_bPermuted.data() : b.ptr();
-    Real* host_x = (reorder != 0) ? host_xPermuted.data() : x.ptr();
-
-    if (d_hardware.getValue().getSelectedId() != 0)
-    {
-        sofa::helper::ScopedAdvancedTimer copyRHSToDeviceTimer("copyRHSToDevice");
-        checkCudaErrors(cudaMemcpyAsync( device_b, host_b, sizeof(Real)*n, cudaMemcpyHostToDevice,stream));
-        checkCudaErrors(cudaStreamSynchronize(stream));
-    }
-
-    {
-        // LL^t y = Pb
-        sofa::helper::ScopedAdvancedTimer solveTimer("Solve");
-
-        solve_impl(n, b.ptr(), x.ptr());
-        checkCudaErrors(cudaStreamSynchronize(stream));
-    }
-
-    if (d_hardware.getValue().getSelectedId() != 0)
-    {
-        sofa::helper::ScopedAdvancedTimer copySolutionToHostTimer("copySolutionToHost");
-
-        checkCudaErrors(cudaMemcpyAsync( host_x, device_x, sizeof(Real)*n, cudaMemcpyDeviceToHost,stream));
-        cudaStreamSynchronize(stream);
-    }
-
-    if( reorder != 0 )
-    {
-        sofa::helper::ScopedAdvancedTimer reorderSolutionTimer("reorderSolution");
-        for(int i = 0; i < n; ++i)
-        {
-            x[host_perm[i]] = host_xPermuted[ i ]; // Px = y
-        }
-    }
-
-
-    previous_n = n ;
 }
 
-inline bool compareMatrixShape(const int s_M,const int * M_colind,const int * M_rowptr,const int s_P,const int * P_colind,const int * P_rowptr)
+inline bool compareMatrixShape(const int s_M, const int* M_colind, const int* M_rowptr,
+                                const int s_P, const int* P_colind, const int* P_rowptr)
 {
     if (s_M != s_P) return true;
-    if (M_rowptr[s_M] != P_rowptr[s_M] ) return true; 
-    for (int i=0;i<s_P;i++) {
-        if (M_rowptr[i]!=P_rowptr[i]) return true; 
-    }
-    for (int i=0;i<M_rowptr[s_M];i++) {
-        if (M_colind[i]!=P_colind[i]) return true;
-    }
+    if (s_P <= 0) return true;
+    if (M_rowptr[s_M] != P_rowptr[s_M]) return true;
+    if (std::memcmp(M_rowptr, P_rowptr, sizeof(int) * s_P) != 0) return true;
+    if (std::memcmp(M_colind, P_colind, sizeof(int) * M_rowptr[s_M]) != 0) return true;
     return false;
 }
 
-
-
-}// namespace sofa::component::linearsolver::direct
+} // namespace sofa::component::linearsolver::direct
