@@ -126,7 +126,7 @@ void CUDASparseCholeskySolver<TMatrix, TVector>::setWorkspace()
         }
         else
         {
-            checksolver(cusolverSpScsrcholBufferInfoHost( handle, rows, nnz, descr, device_values, hRow, hCol,
+            checksolver(cusolverSpScsrcholBufferInfoHost( handle, rows, nnz, descr, hValues, hRow, hCol,
                 host_info, &size_internal, &size_work ));
         }
     }
