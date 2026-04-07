@@ -434,7 +434,7 @@ void CUDASparseCholeskySolver<TMatrix,TVector>::solve(Matrix& M, Vector& x, Vect
         // LL^t y = Pb
         sofa::helper::ScopedAdvancedTimer solveTimer("Solve");
 
-        solve_impl(n, x.ptr(), b.ptr());
+        solve_impl(n, b.ptr(), x.ptr());
         checkCudaErrors(cudaStreamSynchronize(stream));
     }
 
