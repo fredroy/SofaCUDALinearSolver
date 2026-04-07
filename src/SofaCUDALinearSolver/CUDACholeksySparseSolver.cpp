@@ -38,15 +38,23 @@ int CUDASparseCholeskySolverClass = core::RegisterObject("Direct linear solver b
     .add< CUDASparseCholeskySolver< CompressedRowSparseMatrix<sofa::type::Mat<3, 3, double> >,FullVector<double> > >()
 ;
 
-using OtherFloatingType = std::conditional_t<std::is_same_v<SReal, double>, float, double>;
-template struct SOFACUDALINEARSOLVER_API sofa::component::linearsystem::MappedMassMatrixObserver<OtherFloatingType>;
-template class SOFACUDALINEARSOLVER_API sofa::component::linearsystem::MatrixProjectionMethod<sofa::linearalgebra::CompressedRowSparseMatrix<OtherFloatingType> >;
-template class SOFACUDALINEARSOLVER_API sofa::component::linearsolver::MatrixLinearSolver< CompressedRowSparseMatrix<OtherFloatingType>,FullVector<OtherFloatingType> > ;
-template class SOFACUDALINEARSOLVER_API sofa::component::linearsolver::MatrixLinearSolver< CompressedRowSparseMatrix<sofa::type::Mat<3, 3, OtherFloatingType> >,FullVector<OtherFloatingType> > ;
-
 template class SOFACUDALINEARSOLVER_API CUDASparseCholeskySolver< CompressedRowSparseMatrix<float>,FullVector<float> > ;
 template class SOFACUDALINEARSOLVER_API CUDASparseCholeskySolver< CompressedRowSparseMatrix<sofa::type::Mat<3, 3, float> >,FullVector<float> > ;
 template class SOFACUDALINEARSOLVER_API CUDASparseCholeskySolver< CompressedRowSparseMatrix<double>,FullVector<double> > ;
 template class SOFACUDALINEARSOLVER_API CUDASparseCholeskySolver< CompressedRowSparseMatrix<sofa::type::Mat<3, 3, double> >,FullVector<double> > ;
 
 } // namespace sofa::component::linearsolver::direct
+
+using OtherFloatingType = std::conditional_t<std::is_same_v<SReal, double>, float, double>;
+
+namespace sofa::component::linearsystem
+{
+template struct SOFACUDALINEARSOLVER_API MappedMassMatrixObserver<OtherFloatingType>;
+template class SOFACUDALINEARSOLVER_API MatrixProjectionMethod<sofa::linearalgebra::CompressedRowSparseMatrix<OtherFloatingType> >;
+}
+
+namespace sofa::component::linearsolver
+{
+template class SOFACUDALINEARSOLVER_API MatrixLinearSolver< CompressedRowSparseMatrix<OtherFloatingType>,FullVector<OtherFloatingType> > ;
+template class SOFACUDALINEARSOLVER_API MatrixLinearSolver< CompressedRowSparseMatrix<sofa::type::Mat<3, 3, OtherFloatingType> >,FullVector<OtherFloatingType> > ;
+}
