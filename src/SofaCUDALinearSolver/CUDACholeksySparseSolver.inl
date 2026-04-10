@@ -126,7 +126,7 @@ void CUDASparseCholeskySolver<TMatrix, TVector>::setWorkspace()
         }
         else
         {
-            checksolver(cusolverSpScsrcholBufferInfoHost( handle, rows, nnz, descr, device_values, hRow, hCol,
+            checksolver(cusolverSpScsrcholBufferInfoHost( handle, rows, nnz, descr, hValues, hRow, hCol,
                 host_info, &size_internal, &size_work ));
         }
     }
@@ -434,7 +434,7 @@ void CUDASparseCholeskySolver<TMatrix,TVector>::solve(Matrix& M, Vector& x, Vect
         // LL^t y = Pb
         sofa::helper::ScopedAdvancedTimer solveTimer("Solve");
 
-        solve_impl(n, x.ptr(), b.ptr());
+        solve_impl(n, b.ptr(), x.ptr());
         checkCudaErrors(cudaStreamSynchronize(stream));
     }
 
